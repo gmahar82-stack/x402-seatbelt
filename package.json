@@ -1,0 +1,67 @@
+{
+  "name": "x402-seatbelt",
+  "version": "0.1.0",
+  "description": "A seatbelt for AI agents that pay with x402: spending budgets, per-payment caps and an optional Pay Safe check before every payment. Wraps fetch; works with @x402/fetch.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "x402",
+    "agents",
+    "ai-agents",
+    "payments",
+    "usdc",
+    "budget",
+    "safety",
+    "fetch",
+    "seatbelt",
+    "spending-limit"
+  ],
+  "author": "gmahar82-stack",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gmahar82-stack/x402-seatbelt.git"
+  },
+  "homepage": "https://github.com/gmahar82-stack/x402-seatbelt#readme",
+  "bugs": {
+    "url": "https://github.com/gmahar82-stack/x402-seatbelt/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@x402/core": "^2.27.0",
+    "@x402/evm": "^2.27.0",
+    "@x402/fetch": "^2.27.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "viem": "^2.56.9"
+  }
+}
