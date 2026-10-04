@@ -60,6 +60,37 @@ With `paySafe: true`, each payment is checked by [Pay Safe](https://agent-deals.
 
 **What is sent:** the service URL and the payment terms (amount, asset, network, pay-to wallet). **Never** the signature, your keys or your request content. Answers are cached for a minute. The check is free. Pay Safe is run by the author of this package, and its accuracy tests are [published](https://agent-deals.gm-tools.workers.dev/trust).
 
+### Pointing Pay Safe at your own endpoint
+
+Set `paySafeUrl` to any endpoint that implements the verdict protocol below, and the seatbelt consults it instead of the public Pay Safe. This is how third-party risk oracles plug in.
+
+**Request.** `POST` with `Content-Type: application/json` and `User-Agent: x402-seatbelt`:
+
+```json
+{
+  "url": "https://service.example/v1/thing",
+  "method": "POST",
+  "payment_required": {
+    "x402Version": 2,
+    "resource": { "url": "https://service.example/v1/thing" },
+    "accepts": [
+      { "scheme": "exact", "network": "eip155:8453", "amount": "30000",
+        "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA4", "payTo": "0xabc..." }
+    ]
+  }
+}
+```
+
+The `accepts` array carries the payment terms the seatbelt parsed (or reconstructed) from the 402 response: scheme, network, amount in base units as a string, asset contract and pay-to wallet. Only the service URL, the HTTP method and the payment terms are sent.
+
+**Response.** JSON with a `verdict` of `"go"`, `"caution"` or `"stop"`, plus an optional human-readable `summary` and optional `findings`:
+
+```json
+{ "verdict": "caution", "summary": "Wallet differs from the service's usual one", "findings": ["payTo not seen before"] }
+```
+
+A non-2xx status or a missing/invalid verdict counts as "unavailable": the payment goes through unless `paySafeFailClosed` is set. `stop` always blocks; `caution` blocks only when `paySafeBlock` is `"caution"`. Answers are cached for 60 seconds per service URL and payment terms. The request times out after `paySafeTimeoutMs` (default 8000 ms).
+
 ## Also for Python
 
 [`agentseatbelt`](https://pypi.org/project/agentseatbelt/) does the same for Python agents (httpx, requests and Coinbase's `x402` client), plus LLM cost budgets, rate limits and loop detection.
