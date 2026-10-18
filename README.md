@@ -41,14 +41,33 @@ No dependencies. It works anywhere `fetch` does: Node 18+, Deno, Bun, Cloudflare
 | `paySafeBlock` | `"stop"` (default) blocks STOP answers; `"caution"` also blocks CAUTION. |
 | `paySafeFailClosed` | Blocks payments when Pay Safe can't be reached (default: let them through). |
 | `paySafeUrl`, `paySafeTimeoutMs` | Endpoint (default: the public Pay Safe) and timeout (default 8000). |
-| `onEvent` | A callback for every payment, block and Pay Safe answer. |
+| `lostAnswerRetries` | When a signed payment gets no answer, resend the same signed payment up to this many times (default 2). See below. |
+| `lostAnswerRetryDelayMs` | Wait before each resend, times the attempt number (default 1000). |
+| `blockNewPaymentWhileUnconfirmed` | Block a new signed payment for a request whose earlier payment is unconfirmed (default `true`). |
+| `onEvent` | A callback for every payment, block, resend and Pay Safe answer. |
 
 - `seatbelt.stop()` blocks every further payment (an emergency stop).
-- `seatbelt.report()` returns payments, `spentUsd`, `pendingUsd`, blocked count, Pay Safe checks and the last 200 events.
+- `seatbelt.report()` returns payments, `spentUsd`, `pendingUsd`, `unconfirmedUsd` (with the `unconfirmed` list), blocked count, Pay Safe checks and the last 200 events.
+- `seatbelt.resolveUnconfirmed(url, charged, method = "GET")` settles an unconfirmed payment once you know whether it was charged.
 
-A blocked payment throws **`PaymentBlockedError`** with a `reason`: `budget`, `max_payment`, `max_payments`, `unknown_value`, `pay_safe`, `pay_safe_unavailable` or `stopped`. The error also carries the `payment`, and Pay Safe's `verdict` when that was the cause.
+A blocked payment throws **`PaymentBlockedError`** with a `reason`: `budget`, `max_payment`, `max_payments`, `unknown_value`, `pay_safe`, `pay_safe_unavailable`, `stopped` or `unconfirmed_payment`. The error also carries the `payment`, and Pay Safe's `verdict` when that was the cause.
 
 Failed calls aren't counted: a payment only counts when the service accepted it (a `PAYMENT-RESPONSE` header or a 2xx answer). x402 v1 and v2 are both supported.
+
+### Lost answers: resend, never re-sign
+
+If a signed payment gets no answer (connection reset, timeout, or a 502/503/504/52x gateway error), the seller may
+still have settled it. Signing a new payment then could pay twice. So the seatbelt:
+
+1. Resends the **same** signed payment (up to `lostAnswerRetries` times). A signed payment can be settled only once,
+   so this is safe, and a seller that already settled it can answer normally.
+2. If there's still no answer, marks the payment **unconfirmed**: it keeps counting against `maxTotalUsd`, shows up in
+   `report().unconfirmed`, and a **new** signed payment for the same request is blocked with
+   `reason: "unconfirmed_payment"`. Resending the same signed payment is still allowed.
+3. Once you know (from your wallet or a block explorer), call `seatbelt.resolveUnconfirmed(url, charged)`.
+
+Request bodies that are streams can't be resent, so those go straight to step 2. Thanks to MusedIn for pointing this
+case out.
 
 ## Pay Safe (optional, off by default)
 

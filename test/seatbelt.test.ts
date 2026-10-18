@@ -203,3 +203,151 @@ test("official @x402/fetch client: payment counted once, cap enforced", async ()
     seller.close();
   }
 });
+
+// ---- lost answers: the payment may have been settled although no answer came back -------------------------
+
+/** A seller that settles each signed payment once and drops the first `drops` answers (or answers `dropStatus`). */
+function flakySeller(opts: { drops: number; dropStatus?: number; resendStatus?: number }) {
+  const settled = new Set<string>();
+  let sends = 0;
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    const sig = req.headers.get("payment-signature");
+    if (!sig) {
+      const quote = { x402Version: 2, resource: { url: req.url }, accepts: [terms()] };
+      return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64(quote) } });
+    }
+    sends++;
+    const again = settled.has(sig);
+    settled.add(sig); // charged now, whatever happens to the answer
+    if (sends <= opts.drops) {
+      if (opts.dropStatus) return new Response("gateway timeout", { status: opts.dropStatus });
+      throw new TypeError("fetch failed: connection reset");
+    }
+    if (again && opts.resendStatus) return new Response("{}", { status: opts.resendStatus });
+    return new Response('{"data":1}', { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true }) } });
+  }) as typeof fetch;
+  return { fetchImpl, charged: () => settled.size, sends: () => sends };
+}
+
+const signed = (accepted: unknown, sig: string) => ({ "PAYMENT-SIGNATURE": b64({ x402Version: 2, accepted, payload: { signature: sig } }) });
+
+test("lost answer: the same signed payment is resent and counted once", async () => {
+  const seller = flakySeller({ drops: 1 });
+  const seatbelt = createSeatbelt({ maxTotalUsd: 1, lostAnswerRetryDelayMs: 0 });
+  const res = await pay(seatbelt.wrap(seller.fetchImpl));
+  assert.equal(res.status, 200);
+  assert.equal(seller.sends(), 2);
+  assert.equal(seller.charged(), 1);
+  const r = seatbelt.report();
+  assert.equal(r.payments, 1);
+  assert.equal(r.spentUsd, 0.01);
+  assert.equal(r.unconfirmedUsd, 0);
+  assert.equal(r.pendingUsd, 0);
+  assert.ok(r.events.some((e) => e.type === "resend"));
+});
+
+test("answer never comes: the payment stays counted and a NEW signature for it is blocked", async () => {
+  const seller = flakySeller({ drops: 100 });
+  const seatbelt = createSeatbelt({ maxTotalUsd: 0.015, lostAnswerRetries: 1, lostAnswerRetryDelayMs: 0 });
+  const f = seatbelt.wrap(seller.fetchImpl);
+  const accepted = terms();
+  await assert.rejects(f(URL_, { headers: signed(accepted, "0xFIRST") }), /connection reset/);
+  assert.equal(seller.sends(), 2); // first send + one resend of the same signature
+  let r = seatbelt.report();
+  assert.equal(r.unconfirmedUsd, 0.01);
+  assert.equal(r.unconfirmed.length, 1);
+  assert.equal(r.unconfirmed[0].url, URL_);
+  assert.equal(r.pendingUsd, 0);
+
+  // A new signature for the same request could pay twice: blocked before it leaves.
+  await assert.rejects(f(URL_, { headers: signed(accepted, "0xSECOND") }), (e: any) => e.reason === "unconfirmed_payment");
+  // It still counts against the budget: another $0.01 payment elsewhere would cross $0.015.
+  await assert.rejects(f("https://other.example.com/x", { headers: signed(accepted, "0xOTHER") }), (e: any) => e.reason === "budget");
+  assert.equal(seller.charged(), 1);
+
+  // Resending the same signed payment is always allowed (and doesn't reserve the amount twice).
+  await assert.rejects(f(URL_, { headers: signed(accepted, "0xFIRST") }), /connection reset/);
+  r = seatbelt.report();
+  assert.equal(r.unconfirmedUsd, 0.01);
+
+  // The owner checks the wallet: not charged. The budget is free again and new payments can go.
+  assert.equal(seatbelt.resolveUnconfirmed(URL_, false), true);
+  r = seatbelt.report();
+  assert.equal(r.unconfirmedUsd, 0);
+  assert.equal(r.spentUsd, 0);
+  assert.equal(seatbelt.resolveUnconfirmed(URL_, false), false);
+});
+
+test("resolveUnconfirmed(charged) counts the payment as spent", async () => {
+  const seller = flakySeller({ drops: 100 });
+  const seatbelt = createSeatbelt({ lostAnswerRetries: 0 });
+  await assert.rejects(pay(seatbelt.wrap(seller.fetchImpl)));
+  assert.equal(seller.sends(), 1);
+  seatbelt.resolveUnconfirmed(URL_, true);
+  const r = seatbelt.report();
+  assert.equal(r.payments, 1);
+  assert.equal(r.spentUsd, 0.01);
+  assert.equal(r.unconfirmedUsd, 0);
+});
+
+test("gateway timeout then 'already used' on resend: unconfirmed, not released", async () => {
+  const seller = flakySeller({ drops: 1, dropStatus: 504, resendStatus: 402 });
+  const seatbelt = createSeatbelt({ lostAnswerRetryDelayMs: 0 });
+  const res = await pay(seatbelt.wrap(seller.fetchImpl));
+  assert.equal(res.status, 402);
+  const r = seatbelt.report();
+  assert.equal(r.unconfirmedUsd, 0.01);
+  assert.equal(r.payments, 0);
+  assert.ok(!r.events.some((e) => e.type === "not_charged"));
+});
+
+test("a plain server error is still 'not charged' and isn't resent", async () => {
+  const { fetchImpl, log } = network({ paidStatus: 500 });
+  const seatbelt = createSeatbelt({ lostAnswerRetryDelayMs: 0 });
+  await pay(seatbelt.wrap(fetchImpl));
+  assert.equal(log.paid, 1);
+  assert.equal(seatbelt.report().unconfirmedUsd, 0);
+});
+
+test("blockNewPaymentWhileUnconfirmed: false lets a new signature through", async () => {
+  const seller = flakySeller({ drops: 1 });
+  const seatbelt = createSeatbelt({ lostAnswerRetries: 0, blockNewPaymentWhileUnconfirmed: false });
+  const f = seatbelt.wrap(seller.fetchImpl);
+  await assert.rejects(f(URL_, { headers: signed(terms(), "0xA") }));
+  const res = await f(URL_, { headers: signed(terms(), "0xB") });
+  assert.equal(res.status, 200);
+  const r = seatbelt.report();
+  assert.equal(r.spentUsd, 0.01);
+  assert.equal(r.unconfirmedUsd, 0.01);
+});
+
+test("official @x402/fetch client: a dropped connection is resent with the same signature, paid once", async () => {
+  const signatures: string[] = [];
+  const server = createServer((req, res) => {
+    const url = `http://${req.headers.host}${req.url}`;
+    const sig = req.headers["payment-signature"] as string | undefined;
+    if (sig) {
+      signatures.push(sig);
+      if (signatures.length === 1) return req.socket.destroy(); // settled, but the answer is lost
+      res.writeHead(200, { "content-type": "application/json", "PAYMENT-RESPONSE": b64({ success: true, transaction: "0x", network: "eip155:8453" }) });
+      return res.end('{"data":1}');
+    }
+    const accepts = [{ ...terms(), extra: { name: "USD Coin", version: "2" } }];
+    res.writeHead(402, { "content-type": "application/json", "PAYMENT-REQUIRED": b64({ x402Version: 2, resource: { url }, accepts }) });
+    res.end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as AddressInfo;
+  try {
+    const seatbelt = createSeatbelt({ maxTotalUsd: 1, lostAnswerRetryDelayMs: 0 });
+    const res = await officialClient(seatbelt.wrap(fetch))(`http://127.0.0.1:${port}/paid`);
+    assert.equal(res.status, 200);
+    assert.equal(signatures.length, 2);
+    assert.equal(signatures[0], signatures[1]); // never a second, different payment
+    assert.equal(seatbelt.report().payments, 1);
+    assert.equal(seatbelt.report().spentUsd, 0.01);
+  } finally {
+    server.close();
+  }
+});

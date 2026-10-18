@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (2026-10-18)
+
+- Lost answers: when a signed payment gets no answer (network error, timeout, 502/503/504/52x), the seatbelt resends
+  the same signed payment (`lostAnswerRetries`, default 2; `lostAnswerRetryDelayMs`, default 1000) and never signs
+  a new one
+- Still no answer: the payment is "unconfirmed". It keeps counting against `maxTotalUsd`, is listed in
+  `report().unconfirmed` / `unconfirmedUsd`, and a new signed payment for the same request is blocked
+  (`reason: "unconfirmed_payment"`; turn off with `blockNewPaymentWhileUnconfirmed: false`)
+- `seatbelt.resolveUnconfirmed(url, charged, method)` settles it by hand
+- Behaviour change: a payment whose request threw used to be counted as "not charged"; it's now unconfirmed
+
 ## 0.1.0 (2026-09-28)
 
 First release.

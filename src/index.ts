@@ -7,6 +7,7 @@ export {
   type SeatbeltReport,
   type SeatbeltEvent,
   type BlockReason,
+  type UnconfirmedPayment,
   type PaySafeVerdict,
 } from "./seatbelt.js";
-export { parsePayment, parseQuote, hasPayment, type Payment, type PaymentTerms } from "./payment.js";
+export { parsePayment, parseQuote, hasPayment, paymentHeader, type Payment, type PaymentTerms } from "./payment.js";

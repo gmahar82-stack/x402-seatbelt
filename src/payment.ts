@@ -75,6 +75,11 @@ export function hasPayment(headers: HeaderSource): boolean {
   return PAYMENT_HEADERS.some((h) => headers.get(h));
 }
 
+/** The signed payment exactly as sent, or null: the same value means the same payment. */
+export function paymentHeader(headers: HeaderSource): string | null {
+  return PAYMENT_HEADERS.map((h) => headers.get(h)).find(Boolean) ?? null;
+}
+
 export function isSettled(headers: HeaderSource): boolean {
   return RESPONSE_HEADERS.some((h) => headers.get(h));
 }

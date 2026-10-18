@@ -1,9 +1,11 @@
 // The seatbelt: wraps fetch, and checks every x402 payment before it leaves this machine.
-import { describe, hasPayment, isSettled, parsePayment, parseQuote, type Payment } from "./payment.js";
+import { describe, isSettled, parsePayment, parseQuote, paymentHeader, type Payment } from "./payment.js";
 
 export const PAY_SAFE_URL = "https://agent-deals.gm-tools.workers.dev/v1/preflight";
 const PAY_SAFE_CACHE_MS = 60_000; // the same payment to the same service isn't re-checked within a minute
 const MAX_EVENTS = 200;
+/** Gateway errors: the seller's server may have settled the payment before the answer was lost. */
+const LOST_ANSWER_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
 
 export interface SeatbeltOptions {
   /** Total budget for all payments made through this seatbelt (USDC). A payment that would cross it is never sent. */
@@ -24,11 +26,32 @@ export interface SeatbeltOptions {
   paySafeFailClosed?: boolean;
   paySafeUrl?: string;
   paySafeTimeoutMs?: number;
+  /**
+   * When a signed payment gets no answer (network error, timeout, or a 502/503/504/52x gateway error) the seller
+   * may still have settled it. The seatbelt then resends the SAME signed payment, which can be settled at most
+   * once, up to this many times (default 2). It never signs a new one.
+   */
+  lostAnswerRetries?: number;
+  /** Wait before each resend, multiplied by the attempt number (default 1000 ms). */
+  lostAnswerRetryDelayMs?: number;
+  /**
+   * While a payment is unconfirmed, block a NEW signed payment for the same request (default true): it could pay
+   * twice. Resending the same signed payment is always allowed. Clear it with `seatbelt.resolveUnconfirmed()`.
+   */
+  blockNewPaymentWhileUnconfirmed?: boolean;
   /** Called for every event (payments, blocks, Pay Safe answers). */
   onEvent?: (event: SeatbeltEvent) => void;
 }
 
-export type BlockReason = "max_payment" | "budget" | "max_payments" | "unknown_value" | "pay_safe" | "pay_safe_unavailable" | "stopped";
+export type BlockReason =
+  | "max_payment"
+  | "budget"
+  | "max_payments"
+  | "unknown_value"
+  | "pay_safe"
+  | "pay_safe_unavailable"
+  | "stopped"
+  | "unconfirmed_payment";
 
 export interface PaySafeVerdict {
   verdict: "go" | "caution" | "stop";
@@ -39,7 +62,7 @@ export interface PaySafeVerdict {
 
 export interface SeatbeltEvent {
   time: number;
-  type: "payment" | "not_charged" | "blocked" | "pay_safe" | "quote";
+  type: "payment" | "not_charged" | "blocked" | "pay_safe" | "quote" | "resend" | "unconfirmed";
   detail: string;
   url?: string;
   payment?: Payment;
@@ -52,6 +75,9 @@ export interface SeatbeltReport {
   spentUsd: number;
   /** Payments sent and still waiting for an answer. */
   pendingUsd: number;
+  /** Payments whose answer was lost: they may or may not have been charged, so they count against the budget. */
+  unconfirmedUsd: number;
+  unconfirmed: UnconfirmedPayment[];
   /** Payments stopped before they were sent. */
   blocked: number;
   /** Payments in assets other than USDC (not counted in spentUsd). */
@@ -59,6 +85,15 @@ export interface SeatbeltReport {
   paySafeChecks: number;
   stopped: boolean;
   events: SeatbeltEvent[];
+}
+
+export interface UnconfirmedPayment {
+  url: string;
+  method: string;
+  payment: Payment;
+  /** When the answer was lost (ms since epoch). */
+  since: number;
+  why: string;
 }
 
 /** A payment was stopped before it was sent: nothing was paid, the signed payment never left this machine. */
@@ -83,8 +118,12 @@ function requestParts(input: RequestInfo | URL, init?: RequestInit) {
   const url = isRequest ? (input as Request).url : input instanceof URL ? input.href : String(input);
   const method = (init?.method ?? (isRequest ? (input as Request).method : "GET")).toUpperCase();
   const headers = new Headers(init?.headers ?? (isRequest ? (input as Request).headers : undefined));
-  return { url, method, headers };
+  return { url, method, headers, isRequest };
 }
+
+type Sent = { key: string; method: string; signature: string; resend: boolean; answerLost: boolean };
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class Seatbelt {
   private readonly options: SeatbeltOptions;
@@ -95,6 +134,9 @@ export class Seatbelt {
   private events: SeatbeltEvent[] = [];
   private quotes = new Map<string, Record<string, unknown>[]>();
   private paySafeAnswers = new Map<string, { at: number; answer: PaySafeVerdict }>();
+  /** Payments whose answer was lost, by the signed payment exactly as it was sent. */
+  private lost = new Map<string, UnconfirmedPayment & { key: string }>();
+  private unconfirmedTotal = 0;
 
   constructor(options: SeatbeltOptions = {}) {
     if (options.paySafeBlock && !["stop", "caution"].includes(options.paySafeBlock)) {
@@ -110,19 +152,77 @@ export class Seatbelt {
    */
   wrap(baseFetch: Fetch = globalThis.fetch): Fetch {
     const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const { url, method, headers } = requestParts(input, init);
-      const payment = hasPayment(headers) ? await this.checkPayment(url, method, headers, baseFetch) : null;
-      let response: Response;
-      try {
-        response = await baseFetch(input, init);
-      } catch (error) {
-        if (payment) this.release(payment, url, "the request failed");
-        throw error;
+      const { url, method, headers, isRequest } = requestParts(input, init);
+      const key = `${method} ${url}`;
+      const signature = paymentHeader(headers);
+      if (!signature) {
+        const response = await baseFetch(input, init);
+        await this.recordResponse(url, response, null);
+        return response;
       }
-      await this.recordResponse(url, response, payment);
-      return response;
+      // The same signed payment sent again (after a lost answer) is already counted: it can't be charged twice.
+      const earlier = this.lost.get(signature);
+      const resend = earlier?.key === key;
+      const payment = resend ? earlier!.payment : await this.checkPayment(url, method, headers, baseFetch, key);
+      if (!payment) {
+        const response = await baseFetch(input, init);
+        await this.recordResponse(url, response, null);
+        return response;
+      }
+
+      // A body that can be read only once (a stream) can't be resent, so a lost answer isn't retried then.
+      const template = isRequest ? (input as Request).clone() : null;
+      const canResend = !(typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream);
+      const signal = init?.signal ?? (isRequest ? (input as Request).signal : undefined);
+      const retries = canResend ? Math.max(0, this.options.lostAnswerRetries ?? 2) : 0;
+      const delay = this.options.lostAnswerRetryDelayMs ?? 1000;
+      let answerLost = resend;
+
+      for (let attempt = 0; ; attempt++) {
+        let response: Response | undefined;
+        let error: unknown;
+        try {
+          response = await baseFetch(attempt === 0 || !template ? input : template.clone(), init);
+        } catch (e) {
+          error = e;
+        }
+        const lostNow = response === undefined || (LOST_ANSWER_STATUSES.has(response.status) && !isSettled(response.headers));
+        if (lostNow && attempt < retries && !signal?.aborted) {
+          answerLost = true;
+          await response?.body?.cancel();
+          const why = response ? `HTTP ${response.status}` : `no answer (${(error as Error)?.message ?? error})`;
+          this.event("resend", `${why}; resending the same signed payment (${attempt + 1}/${retries}): ${describe(payment)}`, url, payment);
+          await sleep(delay * (attempt + 1));
+          continue;
+        }
+        const sent = { key, method, signature, resend, answerLost };
+        if (lostNow) {
+          this.markUnconfirmed(url, payment, sent, response ? `HTTP ${response.status}` : "no answer");
+          if (response === undefined) throw error;
+          return response;
+        }
+        await this.recordResponse(url, response!, payment, sent);
+        return response!;
+      }
     };
     return wrapped as Fetch;
+  }
+
+  /**
+   * Settle an unconfirmed payment by hand, once you know (e.g. from your wallet or a block explorer) whether it was
+   * charged. `charged: true` counts it as spent; false gives the amount back to the budget. Returns false if no
+   * unconfirmed payment matches.
+   */
+  resolveUnconfirmed(url: string, charged: boolean, method = "GET"): boolean {
+    const key = `${method.toUpperCase()} ${url}`;
+    const found = [...this.lost].find(([, e]) => e.key === key);
+    if (!found) return false;
+    const [signature, entry] = found;
+    this.lost.delete(signature);
+    if (entry.payment.usd !== null) this.unconfirmedTotal -= entry.payment.usd;
+    if (charged) this.countPaid(entry.payment, url, " (confirmed by hand)");
+    else this.event("not_charged", `not charged (confirmed by hand): ${describe(entry.payment)}`, url, entry.payment);
+    return true;
   }
 
   /** Stop every further payment (an emergency stop). */
@@ -135,6 +235,8 @@ export class Seatbelt {
       ...this.stats,
       spentUsd: Math.round(this.spent * 1e6) / 1e6,
       pendingUsd: Math.round(this.pending * 1e6) / 1e6,
+      unconfirmedUsd: Math.round(this.unconfirmedTotal * 1e6) / 1e6,
+      unconfirmed: [...this.lost.values()].map(({ key: _key, ...e }) => e),
       stopped: this.stopped,
       events: [...this.events],
     };
@@ -161,10 +263,19 @@ export class Seatbelt {
   }
 
   /** Limits, then (optionally) Pay Safe. Reserves the amount so parallel payments can't overshoot the budget. */
-  private async checkPayment(url: string, method: string, headers: Headers, baseFetch: Fetch): Promise<Payment | null> {
+  private async checkPayment(url: string, method: string, headers: Headers, baseFetch: Fetch, key: string): Promise<Payment | null> {
     const o = this.options;
     const payment = parsePayment(headers, this.quotes.get(url));
     if (!payment) return null;
+    if (o.blockNewPaymentWhileUnconfirmed !== false && [...this.lost.values()].some((e) => e.key === key)) {
+      this.block(
+        "unconfirmed_payment",
+        "an earlier payment for this request got no answer and may already have been charged. Resend that same " +
+          "signed payment, or call seatbelt.resolveUnconfirmed() once you know whether it was charged",
+        payment,
+        url,
+      );
+    }
     this.checkLimits(payment, url);
     if (payment.usd !== null) this.pending += payment.usd; // reserve now: the checks below may wait on the network
     try {
@@ -188,7 +299,7 @@ export class Seatbelt {
       if (payment.usd > o.maxPaymentUsd) this.block("max_payment", `above maxPaymentUsd ($${o.maxPaymentUsd})`, payment, url);
     }
     if (o.maxTotalUsd !== undefined && payment.usd !== null) {
-      const committed = this.spent + this.pending - reservedByThis;
+      const committed = this.spent + this.pending + this.unconfirmedTotal - reservedByThis;
       if (committed + payment.usd > o.maxTotalUsd + 1e-12) {
         this.block("budget", `it would exceed maxTotalUsd ($${o.maxTotalUsd}; $${committed.toFixed(6)} already committed)`, payment, url);
       }
@@ -239,7 +350,36 @@ export class Seatbelt {
     this.event("not_charged", `not charged (${why}): ${describe(payment)}`, url, payment);
   }
 
-  private async recordResponse(url: string, response: Response, payment: Payment | null) {
+  /** A payment that got no answer: it may have been charged, so it keeps counting against the budget. */
+  private markUnconfirmed(url: string, payment: Payment, sent: Sent, why: string) {
+    if (!sent.resend) {
+      if (payment.usd !== null) {
+        this.pending -= payment.usd;
+        this.unconfirmedTotal += payment.usd;
+      }
+      this.lost.set(sent.signature, { key: sent.key, url, method: sent.method, payment, since: Date.now(), why });
+    }
+    this.event(
+      "unconfirmed",
+      `${why}: ${describe(payment)} may or may not have been charged. It still counts against the budget; resend the ` +
+        "same signed payment or call resolveUnconfirmed()",
+      url,
+      payment,
+    );
+  }
+
+  private countPaid(payment: Payment, url: string, note = "") {
+    this.stats.payments++;
+    if (payment.usd === null) {
+      this.stats.unvaluedPayments++;
+      this.event("payment", `paid ${describe(payment)} (not valued in USD)${note}`, url, payment);
+      return;
+    }
+    this.spent += payment.usd;
+    this.event("payment", `paid ${describe(payment)} (total $${this.spent.toFixed(6)})${note}`, url, payment);
+  }
+
+  private async recordResponse(url: string, response: Response, payment: Payment | null, sent?: Sent) {
     if (response.status === 402) {
       let body: unknown;
       if (!response.headers.get("payment-required")) {
@@ -254,18 +394,18 @@ export class Seatbelt {
     }
     if (!payment) return;
     if (!(isSettled(response.headers) || response.ok)) {
-      this.release(payment, url, `HTTP ${response.status}`);
+      // After a lost answer, a refusal (often "already used") doesn't prove the first send wasn't charged.
+      if (sent?.answerLost) this.markUnconfirmed(url, payment, sent, `HTTP ${response.status} after a lost answer`);
+      else this.release(payment, url, `HTTP ${response.status}`);
       return;
     }
-    this.stats.payments++;
-    if (payment.usd === null) {
-      this.stats.unvaluedPayments++;
-      this.event("payment", `paid ${describe(payment)} (not valued in USD)`, url, payment);
-      return;
+    if (sent?.resend) {
+      this.lost.delete(sent.signature);
+      if (payment.usd !== null) this.unconfirmedTotal -= payment.usd;
+    } else if (payment.usd !== null) {
+      this.pending -= payment.usd;
     }
-    this.pending -= payment.usd;
-    this.spent += payment.usd;
-    this.event("payment", `paid ${describe(payment)} (total $${this.spent.toFixed(6)})`, url, payment);
+    this.countPaid(payment, url, sent?.answerLost ? " (after resending the same signed payment)" : "");
   }
 }
 
