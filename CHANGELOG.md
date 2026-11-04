@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-11-04)
 
 Emergency stop: nothing further leaves after `stop()`.
 
