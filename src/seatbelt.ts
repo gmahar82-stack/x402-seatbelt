@@ -96,7 +96,10 @@ export interface UnconfirmedPayment {
   why: string;
 }
 
-/** A payment was stopped before it was sent: nothing was paid, the signed payment never left this machine. */
+/**
+ * A payment was stopped before it was sent: nothing was paid, the signed payment never left this machine.
+ * One exception: reason "stopped" can also refuse a resend of an unconfirmed payment, which may already be charged.
+ */
 export class PaymentBlockedError extends Error {
   readonly reason: BlockReason;
   readonly payment: Payment;
@@ -163,6 +166,9 @@ export class Seatbelt {
       // The same signed payment sent again (after a lost answer) is already counted: it can't be charged twice.
       const earlier = this.lost.get(signature);
       const resend = earlier?.key === key;
+      if (resend && this.stopped) {
+        this.block("stopped", "the seatbelt was stopped. This payment was already sent once and stays unconfirmed, so check your wallet", earlier!.payment, url);
+      }
       const payment = resend ? earlier!.payment : await this.checkPayment(url, method, headers, baseFetch, key);
       if (!payment) {
         const response = await baseFetch(input, init);
@@ -187,13 +193,16 @@ export class Seatbelt {
           error = e;
         }
         const lostNow = response === undefined || (LOST_ANSWER_STATUSES.has(response.status) && !isSettled(response.headers));
-        if (lostNow && attempt < retries && !signal?.aborted) {
+        if (lostNow && attempt < retries && !signal?.aborted && !this.stopped) {
           answerLost = true;
-          await response?.body?.cancel();
           const why = response ? `HTTP ${response.status}` : `no answer (${(error as Error)?.message ?? error})`;
           this.event("resend", `${why}; resending the same signed payment (${attempt + 1}/${retries}): ${describe(payment)}`, url, payment);
           await sleep(delay * (attempt + 1));
-          continue;
+          // stop() may have come during the wait: then nothing more leaves, and the payment stays unconfirmed below.
+          if (!this.stopped) {
+            await response?.body?.cancel();
+            continue;
+          }
         }
         const sent = { key, method, signature, resend, answerLost };
         if (lostNow) {
@@ -225,7 +234,7 @@ export class Seatbelt {
     return true;
   }
 
-  /** Stop every further payment (an emergency stop). */
+  /** Stop every payment that hasn't left yet, and any further resend (an emergency stop). Can't recall one already sent. */
   stop(): void {
     this.stopped = true;
   }

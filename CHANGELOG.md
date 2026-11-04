@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 (2026-11-04)
+
+Emergency stop: nothing further leaves after `stop()`.
+
+- A resend of a payment whose answer was lost now stops too, both automatic resends and the program sending the same signed payment again (`reason: "stopped"`). The payment stays unconfirmed and keeps counting against the budget.
+- README: new section on what emergency stop covers. Thanks to Chris Polaris for asking where the boundary is.
+
 ## 0.2.0 (2026-10-18)
 
 - Lost answers: when a signed payment gets no answer (network error, timeout, 502/503/504/52x), the seatbelt resends
