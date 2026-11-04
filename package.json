@@ -1,6 +1,6 @@
 {
   "name": "x402-seatbelt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A seatbelt for AI agents that pay with x402: spending budgets, per-payment caps and an optional Pay Safe check before every payment. Wraps fetch; works with @x402/fetch.",
   "type": "module",
   "main": "./dist/index.cjs",

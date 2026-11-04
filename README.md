@@ -46,7 +46,7 @@ No dependencies. It works anywhere `fetch` does: Node 18+, Deno, Bun, Cloudflare
 | `blockNewPaymentWhileUnconfirmed` | Block a new signed payment for a request whose earlier payment is unconfirmed (default `true`). |
 | `onEvent` | A callback for every payment, block, resend and Pay Safe answer. |
 
-- `seatbelt.stop()` blocks every further payment (an emergency stop).
+- `seatbelt.stop()` stops every payment that hasn't left yet, and any further resend (an emergency stop). It can't recall one already sent. See [What emergency stop covers](#what-emergency-stop-covers).
 - `seatbelt.report()` returns payments, `spentUsd`, `pendingUsd`, `unconfirmedUsd` (with the `unconfirmed` list), blocked count, Pay Safe checks and the last 200 events.
 - `seatbelt.resolveUnconfirmed(url, charged, method = "GET")` settles an unconfirmed payment once you know whether it was charged.
 
@@ -68,6 +68,16 @@ still have settled it. Signing a new payment then could pay twice. So the seatbe
 
 Request bodies that are streams can't be resent, so those go straight to step 2. Thanks to MusedIn for pointing this
 case out.
+
+### What emergency stop covers
+
+| Payment | After `seatbelt.stop()` |
+|---|---|
+| Not sent yet, including one waiting on Pay Safe | Blocked. It never leaves your machine. |
+| Sent, answer lost | No more resends. It stays **unconfirmed** and keeps counting against the budget. |
+| Already sent | Can't be recalled. The seller may still collect it, and the seatbelt keeps counting it. |
+
+Stop means nothing further leaves your machine. It can't undo what already left, so after a stop, check your wallet for any unconfirmed payment.
 
 ## Pay Safe (optional, off by default)
 

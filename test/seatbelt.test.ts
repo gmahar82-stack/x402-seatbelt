@@ -232,6 +232,52 @@ function flakySeller(opts: { drops: number; dropStatus?: number; resendStatus?: 
 
 const signed = (accepted: unknown, sig: string) => ({ "PAYMENT-SIGNATURE": b64({ x402Version: 2, accepted, payload: { signature: sig } }) });
 
+test("stop during the resend wait: nothing more is sent and the payment stays counted", async () => {
+  const seller = flakySeller({ drops: 100 });
+  const seatbelt = createSeatbelt({ lostAnswerRetries: 2, lostAnswerRetryDelayMs: 200 });
+  setTimeout(() => seatbelt.stop(), 50);
+  await assert.rejects(pay(seatbelt.wrap(seller.fetchImpl)), (e: any) => e.reason === undefined);
+  assert.equal(seller.sends(), 1);
+  const r = seatbelt.report();
+  assert.equal(r.unconfirmedUsd, 0.01);
+  assert.equal(r.unconfirmed.length, 1);
+});
+
+test("stop during the resend wait after a gateway error: the answer is still readable", async () => {
+  const seller = flakySeller({ drops: 100, dropStatus: 504 });
+  const seatbelt = createSeatbelt({ lostAnswerRetries: 2, lostAnswerRetryDelayMs: 200 });
+  setTimeout(() => seatbelt.stop(), 50);
+  const res = await pay(seatbelt.wrap(seller.fetchImpl));
+  assert.equal(res.status, 504);
+  await res.text();
+  assert.equal(seller.sends(), 1);
+  assert.equal(seatbelt.report().unconfirmedUsd, 0.01);
+});
+
+test("after stop, the program sending the same signed payment again is refused", async () => {
+  const seller = flakySeller({ drops: 100 });
+  const seatbelt = createSeatbelt({ lostAnswerRetries: 0 });
+  const wrapped = seatbelt.wrap(seller.fetchImpl);
+  await assert.rejects(pay(wrapped));
+  seatbelt.stop();
+  // The program sends the same signed payment again: refused, still counted.
+  await assert.rejects(pay(wrapped), (e: any) => e.reason === "stopped" && /already sent/.test(e.message));
+  assert.equal(seller.sends(), 1);
+  assert.equal(seatbelt.report().unconfirmedUsd, 0.01);
+});
+
+test("stop while Pay Safe is answering: the payment never leaves", async () => {
+  const { fetchImpl, log } = network();
+  const slow = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new Request(input, init).url === PAY_SAFE) await new Promise((r) => setTimeout(r, 100));
+    return fetchImpl(input, init);
+  }) as typeof fetch;
+  const seatbelt = createSeatbelt({ paySafe: true, paySafeUrl: PAY_SAFE });
+  setTimeout(() => seatbelt.stop(), 30);
+  await assert.rejects(pay(seatbelt.wrap(slow)), (e: any) => e.reason === "stopped");
+  assert.equal(log.paid, 0);
+});
+
 test("lost answer: the same signed payment is resent and counted once", async () => {
   const seller = flakySeller({ drops: 1 });
   const seatbelt = createSeatbelt({ maxTotalUsd: 1, lostAnswerRetryDelayMs: 0 });
